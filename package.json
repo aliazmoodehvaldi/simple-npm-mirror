@@ -1,0 +1,21 @@
+{
+  "name": "npm-mirror",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev": "node --trace-warnings --trace-deprecation --watch index.js",
+    "start": "node index.js"
+  },
+  "contributors": [
+    {
+      "name": "Ali Azmoodeh",
+      "email": "treeroot.ir@gmail.com"
+    }
+  ],
+  "license": "ISC",
+  "dependencies": {
+    "express": "4.21.2",
+    "helmet": "8.1.0"
+  }
+}
