@@ -4,8 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "dev": "node --trace-warnings --trace-deprecation --watch index.js",
-    "start": "node index.js"
+    "dev": "node --env-file=.env --trace-warnings --trace-deprecation --watch index.js",
+    "start": "node --env-file=.env index.js"
   },
   "contributors": [
     {
