@@ -70,30 +70,39 @@ function verifyIntegrity(file, integrity) {
 
 async function fetchJSONFromRegistry(registry, pkg) {
   const url = new URL(`${registry}/${pkg}`);
+  
+  try {
+    const res = await requestWithRedirect({
+      protocol: url.protocol.replace(':', ''),
+      hostname: url.hostname,
+      path: url.pathname + url.search,
+      method: 'GET',
+      headers: { accept: 'application/json' },
+      timeout: 10000
+    });
 
-  const res = await requestWithRedirect({
-    protocol: url.protocol.replace(':', ''),
-    hostname: url.hostname,
-    path: url.pathname + url.search,
-    method: 'GET',
-    headers: { accept: 'application/json' },
-  });
+    if (!res || res.error) return null;
 
-  if (!res || res.error) return null;
+    if (Buffer.isBuffer(res)) {
+      try {
+        return JSON.parse(res.toString());
+      } catch (_) {
+        return null;
+      }
+    }
 
-  if (Buffer.isBuffer(res)) {
-    try {
-      return JSON.parse(res.toString());
-    } catch (_) {}
+    if (typeof res === 'string') {
+      try {
+        return JSON.parse(res);
+      } catch (_) {
+        return null;
+      }
+    }
 
+    return res;
+  } catch (error) {
     return null;
   }
-
-  if (typeof res === 'string') {
-    return JSON.parse(res);
-  }
-
-  return res;
 }
 
 async function fetchSpecificVersionFromRegistry(registry, pkg, version) {
@@ -236,75 +245,50 @@ function mergeMetadata(list) {
   return data;
 }
 
-async function ensureTarball(pkg, version, dist) {
+async function ensureTarballWithPriority(pkg, version, dist) {
   const dest = tarballPath(pkg, version);
-  const tmp = dest + '.tmp';
-
-  if (fs.existsSync(dest)) {
-    if (verifyIntegrity(dest, dist.integrity)) {
-      return true;
-    }
-    fs.unlinkSync(dest);
+  
+  if (fs.existsSync(dest) && verifyIntegrity(dest, dist.integrity)) {
+    return true;
   }
 
-  fs.mkdirSync(pkgPath(pkg), { recursive: true });
-
-  let isDownloaded = false;
-
-  for (const r of REGISTRIES) {
-    if (isDownloaded) {
-      break;
-    }
-
+  for (const registry of REGISTRIES) {
     try {
-      const tarUrl = new URL(dist.tarball);
-      const newUrl = new URL(r);
-
-      tarUrl.host = newUrl.host;
-      tarUrl.protocol = newUrl.protocol;
-
+      const tarballUrl = new URL(dist.tarball);
+      const registryUrl = new URL(registry);
+      tarballUrl.host = registryUrl.host;
+      tarballUrl.protocol = registryUrl.protocol;
+      
+      const tmp = dest + '.tmp';
+      
       const result = await requestWithRedirect({
-        protocol: tarUrl.protocol.replace(':', ''),
-        hostname: tarUrl.hostname,
-        path:
-          (newUrl.pathname === '/' ? '' : newUrl.pathname) +
-          tarUrl.pathname +
-          tarUrl.search,
+        protocol: tarballUrl.protocol.replace(':', ''),
+        hostname: tarballUrl.hostname,
+        path: tarballUrl.pathname + tarballUrl.search,
         method: 'GET',
         outputPath: tmp,
+        timeout: 30000
       });
 
-      if (result && !result?.error && fs.existsSync(tmp)) {
-        const isValid = verifyIntegrity(tmp, dist.integrity);
-
-        if (isValid) {
+      if (result && !result.error && fs.existsSync(tmp)) {
+        if (verifyIntegrity(tmp, dist.integrity)) {
           fs.renameSync(tmp, dest);
-          isDownloaded = true;
-        }
-        if (fs.existsSync(tmp)) {
-          fs.unlinkSync(tmp);
-        }
-
-        if (isValid) {
-          break;
-        }
-      } else {
-        if (fs.existsSync(tmp)) {
-          fs.unlinkSync(tmp);
+          return true;
         }
       }
-    } catch (_) {
-      if (fs.existsSync(tmp)) {
-        fs.unlinkSync(tmp);
-      }
+      
+      if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+      
+    } catch (error) {
+      if (fs.existsSync(dest + '.tmp')) fs.unlinkSync(dest + '.tmp');
     }
   }
+  
+  return false;
+}
 
-  if (fs.existsSync(tmp)) {
-    fs.unlinkSync(tmp);
-  }
-
-  return isDownloaded;
+async function ensureTarball(pkg, version, dist) {
+  return await ensureTarballWithPriority(pkg, version, dist);
 }
 
 async function buildMetadata(pkg, host) {
@@ -317,14 +301,15 @@ async function buildMetadata(pkg, host) {
 
   for (const v of Object.keys(merged.versions)) {
     const meta = merged.versions[v];
-    meta.dist.tarball = `${host}/${pkg}/-/${pkg.split('/').pop()}-${v}.tgz`;
+    if (meta.dist) {
+      meta.dist.tarball = `${host}/${pkg}/-/${pkg.split('/').pop()}-${v}.tgz`;
+    }
   }
 
   fs.writeFileSync(metaPackagePath(pkg), JSON.stringify(merged));
 
   for (const v of Object.keys(merged.versions)) {
     const meta = merged.versions[v];
-
     if (meta.dist && meta.dist.tarball) {
       await ensureTarball(pkg, v, meta.dist);
     }
@@ -334,11 +319,44 @@ async function buildMetadata(pkg, host) {
 }
 
 async function getMetadata(pkg, host) {
-  if (!fs.existsSync(metaPackagePath(pkg))) {
+  const metaPath = metaPackagePath(pkg);
+  
+  if (!fs.existsSync(metaPath)) {
     return await buildMetadata(pkg, host);
   }
 
-  return JSON.parse(fs.readFileSync(metaPackagePath(pkg)).toString());
+  let metadata = JSON.parse(fs.readFileSync(metaPath).toString());
+  
+  const freshMetadata = await fetchAllMetadata(pkg);
+  if (freshMetadata.length > 0) {
+    const mergedFresh = mergeMetadata(freshMetadata);
+    
+    let hasNewVersions = false;
+    for (const [version, meta] of Object.entries(mergedFresh.versions || {})) {
+      if (!metadata.versions[version]) {
+        metadata.versions[version] = meta;
+        hasNewVersions = true;
+      }
+    }
+    
+    if (hasNewVersions) {
+      for (const version of Object.keys(metadata.versions)) {
+        if (metadata.versions[version].dist) {
+          metadata.versions[version].dist.tarball = `${host}/${pkg}/-/${pkg.split('/').pop()}-${version}.tgz`;
+        }
+      }
+      
+      fs.writeFileSync(metaPath, JSON.stringify(metadata));
+      
+      for (const [version, meta] of Object.entries(metadata.versions)) {
+        if (meta.dist && meta.dist.tarball && !fs.existsSync(tarballPath(pkg, version))) {
+          await ensureTarball(pkg, version, meta.dist);
+        }
+      }
+    }
+  }
+  
+  return metadata;
 }
 
 app.use(helmet({ contentSecurityPolicy: false }));
