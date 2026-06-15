@@ -23,6 +23,35 @@ const REGISTRIES = [
 
 const OWN_REGISTRY = process.env.OWN_NPM_URL;
 
+function buildTarballUrl(host, pkg, version) {
+  const cleanHost = host.replace(/\/$/, '');
+  const cleanPkg = pkg.replace(/^\//, '');
+  const fileName = `${cleanPkg.split('/').pop()}-${version}.tgz`;
+  return `${cleanHost}/${cleanPkg}/-/${fileName}`;
+}
+
+function extractPkgAndVersionFromUrl(urlPath) {
+  const patterns = [
+    /\/\/(@[^\/]+\/[^\/]+)\/-\/(.+?)\.tgz$/,
+    /\/(@[^\/]+\/[^\/]+)\/-\/(.+?)\.tgz$/,
+    /\/\/([^\/]+)\/-\/(.+?)\.tgz$/,
+    /\/([^\/]+)\/-\/(.+?)\.tgz$/
+  ];
+  
+  for (const pattern of patterns) {
+    const match = urlPath.match(pattern);
+    if (match) {
+      const pkg = match[1];
+      const fileName = match[2];
+      const versionMatch = fileName.match(/(\d+\.\d+\.\d+(?:-[^\/]+)?)$/);
+      if (versionMatch) {
+        return { pkg, version: versionMatch[1] };
+      }
+    }
+  }
+  return null;
+}
+
 const PKG_DIR = path.join(__dirname, 'packages');
 
 fs.mkdirSync(PKG_DIR, { recursive: true });
@@ -157,7 +186,7 @@ async function updateMetadataWithVersion(pkg, version, versionData) {
   metadata.versions[version] = versionData;
   
   if (metadata.versions[version].dist) {
-    metadata.versions[version].dist.tarball = `${OWN_REGISTRY}/${pkg}/-/${pkg.split('/').pop()}-${version}.tgz`;
+    metadata.versions[version].dist.tarball = buildTarballUrl(OWN_REGISTRY, pkg, version);
   }
   
   fs.writeFileSync(metaPath, JSON.stringify(metadata));
@@ -245,42 +274,82 @@ function mergeMetadata(list) {
   return data;
 }
 
-async function ensureTarballWithPriority(pkg, version, dist) {
+async function getFileHash(filePath) {
+  if (!fs.existsSync(filePath)) return null;
+  
+  return new Promise((resolve) => {
+    const hash = crypto.createHash('sha512');
+    const stream = fs.createReadStream(filePath);
+    
+    stream.on('data', data => hash.update(data));
+    stream.on('end', () => {
+      resolve(`sha512-${hash.digest('base64')}`);
+    });
+    stream.on('error', () => resolve(null));
+  });
+}
+
+async function ensureTarballWithRetry(pkg, version, dist, maxRetries = 3) {
   const dest = tarballPath(pkg, version);
   
-  if (fs.existsSync(dest) && verifyIntegrity(dest, dist.integrity)) {
-    return true;
+  if (fs.existsSync(dest)) {
+    if (verifyIntegrity(dest, dist.integrity)) {
+      return true;
+    } else {
+      fs.unlinkSync(dest);
+    }
   }
 
-  for (const registry of REGISTRIES) {
-    try {
-      const tarballUrl = new URL(dist.tarball);
-      const registryUrl = new URL(registry);
-      tarballUrl.host = registryUrl.host;
-      tarballUrl.protocol = registryUrl.protocol;
-      
-      const tmp = dest + '.tmp';
-      
-      const result = await requestWithRedirect({
-        protocol: tarballUrl.protocol.replace(':', ''),
-        hostname: tarballUrl.hostname,
-        path: tarballUrl.pathname + tarballUrl.search,
-        method: 'GET',
-        outputPath: tmp,
-        timeout: 30000
-      });
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    for (const registry of REGISTRIES) {
+      try {
+        const tarballUrl = new URL(dist.tarball);
+        const registryUrl = new URL(registry);
+        
+        tarballUrl.host = registryUrl.host;
+        tarballUrl.protocol = registryUrl.protocol;
+        
+        const tmp = dest + `.tmp.${attempt}`;
+        
+        const result = await requestWithRedirect({
+          protocol: tarballUrl.protocol.replace(':', ''),
+          hostname: tarballUrl.hostname,
+          path: tarballUrl.pathname + tarballUrl.search,
+          method: 'GET',
+          outputPath: tmp,
+          timeout: 30000,
+          headers: {
+            'Accept-Encoding': 'identity',
+            'User-Agent': 'npm-mirror/1.0.0'
+          }
+        });
 
-      if (result && !result.error && fs.existsSync(tmp)) {
-        if (verifyIntegrity(tmp, dist.integrity)) {
-          fs.renameSync(tmp, dest);
-          return true;
+        if (result && !result.error && fs.existsSync(tmp)) {
+          const stat = fs.statSync(tmp);
+          if (stat.size === 0) {
+            fs.unlinkSync(tmp);
+            continue;
+          }
+          
+          if (verifyIntegrity(tmp, dist.integrity)) {
+            if (fs.existsSync(dest)) fs.unlinkSync(dest);
+            fs.renameSync(tmp, dest);
+            return true;
+          } else {
+            fs.unlinkSync(tmp);
+          }
         }
+        
+        if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+        
+      } catch (error) {
+        if (fs.existsSync(dest + `.tmp.${attempt}`)) 
+          fs.unlinkSync(dest + `.tmp.${attempt}`);
       }
-      
-      if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
-      
-    } catch (error) {
-      if (fs.existsSync(dest + '.tmp')) fs.unlinkSync(dest + '.tmp');
+    }
+    
+    if (attempt < maxRetries) {
+      await new Promise(resolve => setTimeout(resolve, attempt * 1000));
     }
   }
   
@@ -288,7 +357,21 @@ async function ensureTarballWithPriority(pkg, version, dist) {
 }
 
 async function ensureTarball(pkg, version, dist) {
-  return await ensureTarballWithPriority(pkg, version, dist);
+  return await ensureTarballWithRetry(pkg, version, dist);
+}
+
+async function rebuildMetadataOnError(pkg, host) {
+  const metaPath = metaPackagePath(pkg);
+  if (fs.existsSync(metaPath)) {
+    fs.unlinkSync(metaPath);
+  }
+  
+  const pkgDir = pkgPath(pkg);
+  if (fs.existsSync(pkgDir)) {
+    fs.rmSync(pkgDir, { recursive: true, force: true });
+  }
+  
+  return await buildMetadata(pkg, host);
 }
 
 async function buildMetadata(pkg, host) {
@@ -302,7 +385,7 @@ async function buildMetadata(pkg, host) {
   for (const v of Object.keys(merged.versions)) {
     const meta = merged.versions[v];
     if (meta.dist) {
-      meta.dist.tarball = `${host}/${pkg}/-/${pkg.split('/').pop()}-${v}.tgz`;
+      meta.dist.tarball = buildTarballUrl(host, pkg, v);
     }
   }
 
@@ -318,6 +401,92 @@ async function buildMetadata(pkg, host) {
   return merged;
 }
 
+async function checkAndDownloadMissingVersions(pkg) {
+  const metaPath = metaPackagePath(pkg);
+  
+  if (!fs.existsSync(metaPath)) {
+    return;
+  }
+  
+  let metadata;
+  try {
+    metadata = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+  } catch (error) {
+    return;
+  }
+  
+  const freshMetadata = await fetchAllMetadata(pkg);
+  if (!freshMetadata.length) {
+    return;
+  }
+  
+  const mergedFresh = mergeMetadata(freshMetadata);
+  
+  for (const [version, versionData] of Object.entries(mergedFresh.versions || {})) {
+    if (!metadata.versions[version]) {
+      console.log(`Found new version ${version} for ${pkg}, downloading...`);
+      
+      metadata.versions[version] = versionData;
+      
+      if (metadata.versions[version].dist) {
+        metadata.versions[version].dist.tarball = buildTarballUrl(OWN_REGISTRY, pkg, version);
+      }
+      
+      if (versionData.dist && versionData.dist.tarball) {
+        const downloaded = await ensureTarball(pkg, version, versionData.dist);
+        if (downloaded) {
+          console.log(`Successfully downloaded ${pkg}@${version}`);
+        } else {
+          console.log(`Failed to download ${pkg}@${version}`);
+          delete metadata.versions[version];
+          continue;
+        }
+      }
+    }
+  }
+  
+  fs.writeFileSync(metaPath, JSON.stringify(metadata));
+}
+
+async function scanAllPackagesAndUpdate() {
+  console.log('Starting daily background scan for new versions...');
+  
+  if (!fs.existsSync(PKG_DIR)) {
+    console.log('Packages directory not found');
+    return;
+  }
+  
+  const packages = fs.readdirSync(PKG_DIR);
+  let total = 0;
+  let updated = 0;
+  
+  for (const pkg of packages) {
+    const pkgFullPath = path.join(PKG_DIR, pkg);
+    if (!fs.statSync(pkgFullPath).isDirectory()) {
+      continue;
+    }
+    
+    const metaPath = path.join(pkgFullPath, 'package.json');
+    if (!fs.existsSync(metaPath)) {
+      continue;
+    }
+    
+    total++;
+    console.log(`Checking ${pkg}...`);
+    
+    try {
+      await checkAndDownloadMissingVersions(pkg);
+      updated++;
+    } catch (error) {
+      console.error(`Error updating ${pkg}:`, error.message);
+    }
+    
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  
+  console.log(`Background scan completed. Checked ${total} packages, updated ${updated} packages.`);
+}
+
 async function getMetadata(pkg, host) {
   const metaPath = metaPackagePath(pkg);
   
@@ -325,51 +494,24 @@ async function getMetadata(pkg, host) {
     return await buildMetadata(pkg, host);
   }
 
-  let metadata = JSON.parse(fs.readFileSync(metaPath).toString());
-  
-  const freshMetadata = await fetchAllMetadata(pkg);
-  if (freshMetadata.length > 0) {
-    const mergedFresh = mergeMetadata(freshMetadata);
-    
-    let hasNewVersions = false;
-    for (const [version, meta] of Object.entries(mergedFresh.versions || {})) {
-      if (!metadata.versions[version]) {
-        metadata.versions[version] = meta;
-        hasNewVersions = true;
-      }
-    }
-    
-    if (hasNewVersions) {
-      for (const version of Object.keys(metadata.versions)) {
-        if (metadata.versions[version].dist) {
-          metadata.versions[version].dist.tarball = `${host}/${pkg}/-/${pkg.split('/').pop()}-${version}.tgz`;
-        }
-      }
-      
-      fs.writeFileSync(metaPath, JSON.stringify(metadata));
-      
-      for (const [version, meta] of Object.entries(metadata.versions)) {
-        if (meta.dist && meta.dist.tarball && !fs.existsSync(tarballPath(pkg, version))) {
-          await ensureTarball(pkg, version, meta.dist);
-        }
-      }
-    }
-  }
-  
-  return metadata;
+  return JSON.parse(fs.readFileSync(metaPath).toString());
 }
 
-app.use(helmet({ contentSecurityPolicy: false }));
-
-app.use(helmet.crossOriginResourcePolicy({ policy: 'cross-origin' }));
-
-app.get('/favicon.ico', (req, res) => {
-  res.sendFile(path.join(__dirname, 'favicon.ico'));
-});
-
-app.post('/-/npm/v1/security/advisories/bulk', (req, res) => {
-  res.status(200).json({});
-});
+function sendTarball(res, filePath) {
+  const stat = fs.statSync(filePath);
+  res.setHeader('Content-Type', 'application/octet-stream');
+  res.setHeader('Content-Encoding', 'identity');
+  res.setHeader('Content-Length', stat.size);
+  res.setHeader('Cache-Control', 'public, max-age=31536000');
+  
+  const stream = fs.createReadStream(filePath);
+  stream.on('error', (err) => {
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Stream error' });
+    }
+  });
+  stream.pipe(res);
+}
 
 async function metadataCallback({ res, pkg, checkExist, next, req }) {
   if (checkExist) {
@@ -400,10 +542,7 @@ async function metadataCallback({ res, pkg, checkExist, next, req }) {
 
 async function tarballCallback({ res, pkg, file, checkExist, next }) {
   const throwErr = (code, error) => {
-    res.status(code).json({
-      code,
-      error,
-    });
+    res.status(code).json({ code, error });
   };
 
   const versionMatch = file.match(/(\d+\.\d+\.\d+(?:-[^\/]+)?)\.tgz/);
@@ -413,87 +552,157 @@ async function tarballCallback({ res, pkg, file, checkExist, next }) {
   }
 
   const version = versionMatch[1];
-
   const p = tarballPath(pkg, version);
 
   if (checkExist) {
-    return res.status(200).json({ exist: fs.existsSync(p) });
+    const exists = fs.existsSync(p) && verifyIntegrity(p, null);
+    return res.status(200).json({ exist: exists });
   }
 
-  if (!fs.existsSync(p)) {
-    const metaPath = metaPackagePath(pkg);
+  if (fs.existsSync(p)) {
     let meta = null;
-
-    if (fs.existsSync(metaPath)) {
-      try {
-        const metaContent = fs.readFileSync(metaPath, 'utf8');
-        const metadata = JSON.parse(metaContent);
-        meta = metadata?.versions?.[version] ?? null;
-      } catch (_) {
-        meta = null;
-      }
-    }
-
-    if (!meta) {
-      const result = await findVersionInAllRegistries(pkg, version);
+    try {
+      const metadata = JSON.parse(fs.readFileSync(metaPackagePath(pkg), 'utf8'));
+      meta = metadata?.versions?.[version] ?? {};
       
-      if (result && result.versionData) {
-        meta = result.versionData;
-        await updateMetadataWithVersion(pkg, version, meta);
+      if (verifyIntegrity(p, meta?.dist?.integrity)) {
+        return sendTarball(res, p);
       } else {
-        try {
-          const buildResult = await buildMetadata(pkg, OWN_REGISTRY);
-          meta = buildResult?.versions?.[version] ?? null;
-        } catch (_) {
-          return throwErr(
-            404,
-            `Package ${pkg} or version ${version} not found, and metadata build failed.`,
-          );
-        }
+        fs.unlinkSync(p);
       }
+    } catch (_) {
     }
+  }
 
-    if (meta && meta?.dist && meta?.dist?.tarball) {
-      const downloaded = await ensureTarball(pkg, version, meta.dist);
-      if (!downloaded) {
-        return throwErr(500, 'Failed to download tarball');
-      }
-    } else {
-      return throwErr(404, 'Tarball distribution information not found');
+  let meta = null;
+  const metaPath = metaPackagePath(pkg);
+  
+  if (!fs.existsSync(metaPath)) {
+    try {
+      await buildMetadata(pkg, OWN_REGISTRY);
+    } catch (error) {
+      return throwErr(404, `Package ${pkg} not found and metadata build failed: ${error.message}`);
     }
+  }
+
+  try {
+    const metadata = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+    meta = metadata?.versions?.[version] ?? null;
+  } catch (error) {
+    try {
+      await rebuildMetadataOnError(pkg, OWN_REGISTRY);
+      const metadata = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+      meta = metadata?.versions?.[version] ?? null;
+    } catch (_) {
+      return throwErr(404, `Package ${pkg} or version ${version} not found`);
+    }
+  }
+
+  if (!meta || !meta.dist || !meta.dist.tarball) {
+    return throwErr(404, 'Tarball distribution information not found');
+  }
+
+  const downloaded = await ensureTarball(pkg, version, meta.dist);
+  if (!downloaded) {
+    return throwErr(500, 'Failed to download tarball from all registries');
   }
 
   if (!fs.existsSync(p)) {
     return throwErr(404, 'Tarball not found after download attempt');
   }
 
-  let meta = null;
-  try {
-    const metadata = JSON.parse(fs.readFileSync(metaPackagePath(pkg), 'utf8'));
-    meta = metadata?.versions?.[version] ?? {};
-  } catch (_) {
-    meta = {};
-  }
-
-  if (!verifyIntegrity(p, meta?.dist?.integrity)) {
+  if (!verifyIntegrity(p, meta.dist.integrity)) {
     fs.unlinkSync(p);
-    return throwErr(404, 'Tarball integrity check failed');
+    return throwErr(404, 'Tarball integrity check failed after download');
   }
 
-  const stat = fs.statSync(p);
-
-  res.setHeader('Content-Type', 'application/octet-stream');
-  res.setHeader('Content-Encoding', 'identity');
-  res.setHeader('Content-Length', stat.size);
-
-  const stream = fs.createReadStream(p);
-
-  stream.on('error', _ => {
-    next();
-  });
-
-  stream.pipe(res);
+  sendTarball(res, p);
 }
+
+app.use(helmet({ contentSecurityPolicy: false }));
+app.use(helmet.crossOriginResourcePolicy({ policy: 'cross-origin' }));
+
+app.get('/favicon.ico', (req, res) => {
+  res.sendFile(path.join(__dirname, 'favicon.ico'));
+});
+
+app.post('/-/npm/v1/security/advisories/bulk', (req, res) => {
+  res.status(200).json({});
+});
+
+app.get('//@:scope/:name/-/:file', async (req, res, next) => {
+  try {
+    const pkg = `@${req.params.scope}/${req.params.name}`;
+    const file = req.params.file;
+    const checkExist = req.query?.checkExist ?? false;
+    await tarballCallback({ res, pkg, file, checkExist, next });
+  } catch (_) {
+    next();
+  }
+});
+
+app.get('/@:scope/:name/-/:file', async (req, res, next) => {
+  try {
+    const pkg = `@${req.params.scope}/${req.params.name}`;
+    const file = req.params.file;
+    const checkExist = req.query?.checkExist ?? false;
+    await tarballCallback({ res, pkg, file, checkExist, next });
+  } catch (_) {
+    next();
+  }
+});
+
+app.get('//@:scope/:name', async (req, res, next) => {
+  try {
+    const pkg = `@${req.params.scope}/${req.params.name}`;
+    const checkExist = req.query?.checkExist ?? false;
+    await metadataCallback({ res, pkg, checkExist, next, req });
+  } catch (_) {
+    next();
+  }
+});
+
+app.get('/@:scope/:name', async (req, res, next) => {
+  try {
+    const pkg = `@${req.params.scope}/${req.params.name}`;
+    const checkExist = req.query?.checkExist ?? false;
+    await metadataCallback({ res, pkg, checkExist, next, req });
+  } catch (_) {
+    next();
+  }
+});
+
+app.get('//:pkg/-/:file', async (req, res, next) => {
+  try {
+    const pkg = decodeURIComponent(req.params.pkg);
+    const file = req.params.file;
+    const checkExist = req.query?.checkExist ?? false;
+    await tarballCallback({ res, pkg, file, checkExist, next });
+  } catch (_) {
+    next();
+  }
+});
+
+app.get('/:pkg/-/:file', async (req, res, next) => {
+  try {
+    const pkg = decodeURIComponent(req.params.pkg);
+    const file = req.params.file;
+    const checkExist = req.query?.checkExist ?? false;
+    await tarballCallback({ res, pkg, file, checkExist, next });
+  } catch (_) {
+    next();
+  }
+});
+
+app.get('//:pkg', async (req, res, next) => {
+  try {
+    const pkg = decodeURIComponent(req.params.pkg);
+    const checkExist = req.query?.checkExist ?? false;
+    await metadataCallback({ res, pkg, checkExist, next, req });
+  } catch (_) {
+    next();
+  }
+});
 
 app.get('/:pkg', async (req, res, next) => {
   try {
@@ -505,40 +714,15 @@ app.get('/:pkg', async (req, res, next) => {
   }
 });
 
-app.get('/:scope/:name', async (req, res, next) => {
-  try {
-    const pkg = decodeURIComponent(`${req.params.scope}/${req.params.name}`);
-    const checkExist = req.query?.checkExist ?? false;
-    await metadataCallback({ res, pkg, checkExist, next, req });
-  } catch (_) {
-    next();
-  }
-});
-
-app.get('/:pkg/-/:file', async (req, res, next) => {
-  try {
-    const rawPkg = req.params.pkg;
-    const pkg = decodeURIComponent(rawPkg);
-    const file = req.params.file;
-    const checkExist = req.query?.checkExist ?? false;
-    await tarballCallback({ res, pkg, file, checkExist, next });
-  } catch (_) {
-    next();
-  }
-});
-
-app.get('/:scope/:name/-/:file', async (req, res, next) => {
-  try {
-    const pkg = decodeURIComponent(`${req.params.scope}/${req.params.name}`);
-    const file = req.params.file;
-    const checkExist = req.query?.checkExist ?? false;
-    await tarballCallback({ res, pkg, file, checkExist, next });
-  } catch (_) {
-    next();
-  }
-});
-
 app.use((req, res) => {
+  const extracted = extractPkgAndVersionFromUrl(req.path);
+  if (extracted && extracted.pkg && extracted.version) {
+    const p = tarballPath(extracted.pkg, extracted.version);
+    if (fs.existsSync(p)) {
+      return sendTarball(res, p);
+    }
+  }
+  
   res.status(200).json({
     code: 200,
     message: 'Ready',
@@ -552,6 +736,17 @@ app.use((err, req, res, next) => {
   });
 });
 
+setInterval(() => {
+  scanAllPackagesAndUpdate().catch(error => {
+    console.error('Background scan error:', error);
+  });
+}, 24 * 60 * 60 * 1000);
+
+scanAllPackagesAndUpdate().catch(error => {
+  console.error('Initial background scan error:', error);
+});
+
 app.listen(PORT, () => {
   console.log(`NPM Mirror running on port ${PORT}`);
+  console.log('Daily background scan scheduled (every 24 hours)');
 });
