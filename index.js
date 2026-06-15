@@ -1,4 +1,3 @@
-// server.js
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
@@ -95,6 +94,66 @@ async function fetchJSONFromRegistry(registry, pkg) {
   }
 
   return res;
+}
+
+async function fetchSpecificVersionFromRegistry(registry, pkg, version) {
+  try {
+    const fullMetadata = await fetchJSONFromRegistry(registry, pkg);
+    
+    if (fullMetadata && fullMetadata.versions && fullMetadata.versions[version]) {
+      return {
+        versionData: fullMetadata.versions[version],
+        fullMetadata: fullMetadata
+      };
+    }
+    
+    return null;
+  } catch (error) {
+    return null;
+  }
+}
+
+async function findVersionInAllRegistries(pkg, version) {
+  let bestResult = null;
+  
+  for (const registry of REGISTRIES) {
+    const result = await fetchSpecificVersionFromRegistry(registry, pkg, version);
+    
+    if (result) {
+      if (!bestResult) {
+        bestResult = result;
+      }
+    }
+  }
+  
+  return bestResult;
+}
+
+async function updateMetadataWithVersion(pkg, version, versionData) {
+  const metaPath = metaPackagePath(pkg);
+  let metadata = { versions: {} };
+  
+  if (fs.existsSync(metaPath)) {
+    try {
+      metadata = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+    } catch (error) {
+      metadata = { versions: {} };
+    }
+  }
+  
+  if (!metadata.versions) {
+    metadata.versions = {};
+  }
+  
+  metadata.versions[version] = versionData;
+  
+  if (metadata.versions[version].dist) {
+    metadata.versions[version].dist.tarball = `${OWN_REGISTRY}/${pkg}/-/${pkg.split('/').pop()}-${version}.tgz`;
+  }
+  
+  fs.writeFileSync(metaPath, JSON.stringify(metadata));
+  
+  return metadata;
 }
 
 async function fetchAllMetadata(pkg) {
@@ -345,26 +404,34 @@ async function tarballCallback({ res, pkg, file, checkExist, next }) {
 
   if (!fs.existsSync(p)) {
     const metaPath = metaPackagePath(pkg);
-
     let meta = null;
+
     if (fs.existsSync(metaPath)) {
       try {
         const metaContent = fs.readFileSync(metaPath, 'utf8');
-        meta = JSON.parse(metaContent)?.versions?.[version] ?? null;
+        const metadata = JSON.parse(metaContent);
+        meta = metadata?.versions?.[version] ?? null;
       } catch (_) {
         meta = null;
       }
     }
 
     if (!meta) {
-      try {
-        const buildResult = await buildMetadata(pkg, OWN_REGISTRY);
-        meta = buildResult?.versions?.[version] ?? {};
-      } catch (_) {
-        return throwErr(
-          404,
-          `Package ${pkg} or version ${version} not found, and metadata build failed.`,
-        );
+      const result = await findVersionInAllRegistries(pkg, version);
+      
+      if (result && result.versionData) {
+        meta = result.versionData;
+        await updateMetadataWithVersion(pkg, version, meta);
+      } else {
+        try {
+          const buildResult = await buildMetadata(pkg, OWN_REGISTRY);
+          meta = buildResult?.versions?.[version] ?? null;
+        } catch (_) {
+          return throwErr(
+            404,
+            `Package ${pkg} or version ${version} not found, and metadata build failed.`,
+          );
+        }
       }
     }
 
@@ -382,14 +449,17 @@ async function tarballCallback({ res, pkg, file, checkExist, next }) {
     return throwErr(404, 'Tarball not found after download attempt');
   }
 
-  const meta =
-    JSON.parse(fs.readFileSync(metaPackagePath(pkg), 'utf8'))?.versions?.[
-      version
-    ] ?? {};
+  let meta = null;
+  try {
+    const metadata = JSON.parse(fs.readFileSync(metaPackagePath(pkg), 'utf8'));
+    meta = metadata?.versions?.[version] ?? {};
+  } catch (_) {
+    meta = {};
+  }
 
   if (!verifyIntegrity(p, meta?.dist?.integrity)) {
     fs.unlinkSync(p);
-    return throwErr(404, 'Tarball not found after download attempt');
+    return throwErr(404, 'Tarball integrity check failed');
   }
 
   const stat = fs.statSync(p);
@@ -407,9 +477,6 @@ async function tarballCallback({ res, pkg, file, checkExist, next }) {
   stream.pipe(res);
 }
 
-// =====================
-// Metadata route
-// =====================
 app.get('/:pkg', async (req, res, next) => {
   try {
     const pkg = decodeURIComponent(req.params.pkg);
@@ -420,9 +487,6 @@ app.get('/:pkg', async (req, res, next) => {
   }
 });
 
-// =====================
-// Scope Metadata route
-// =====================
 app.get('/:scope/:name', async (req, res, next) => {
   try {
     const pkg = decodeURIComponent(`${req.params.scope}/${req.params.name}`);
@@ -433,9 +497,6 @@ app.get('/:scope/:name', async (req, res, next) => {
   }
 });
 
-// =====================
-// Tarball route
-// =====================
 app.get('/:pkg/-/:file', async (req, res, next) => {
   try {
     const rawPkg = req.params.pkg;
@@ -448,9 +509,6 @@ app.get('/:pkg/-/:file', async (req, res, next) => {
   }
 });
 
-// =====================
-// Scope Tarball route
-// =====================
 app.get('/:scope/:name/-/:file', async (req, res, next) => {
   try {
     const pkg = decodeURIComponent(`${req.params.scope}/${req.params.name}`);
@@ -462,9 +520,6 @@ app.get('/:scope/:name/-/:file', async (req, res, next) => {
   }
 });
 
-// =====================
-// Default route
-// =====================
 app.use((req, res) => {
   res.status(200).json({
     code: 200,
@@ -472,9 +527,6 @@ app.use((req, res) => {
   });
 });
 
-// =====================
-// Global error handler
-// =====================
 app.use((err, req, res, next) => {
   res.status(500).json({
     code: 500,
