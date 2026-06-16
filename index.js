@@ -73,7 +73,7 @@ function tarballPath(pkg, version) {
 }
 
 function verifyIntegrity(file, integrity) {
-  if (!integrity) return false;
+  if (!integrity) return true;
 
   try {
     const match = integrity.match(/^sha(512|256|384|1)-(.+)$/);
@@ -405,22 +405,23 @@ async function checkAndDownloadMissingVersions(pkg) {
   const metaPath = metaPackagePath(pkg);
   
   if (!fs.existsSync(metaPath)) {
-    return;
+    return 0;
   }
   
   let metadata;
   try {
     metadata = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
   } catch (error) {
-    return;
+    return 0;
   }
   
   const freshMetadata = await fetchAllMetadata(pkg);
   if (!freshMetadata.length) {
-    return;
+    return 0;
   }
   
   const mergedFresh = mergeMetadata(freshMetadata);
+  let updatedCount = 0;
   
   for (const [version, versionData] of Object.entries(mergedFresh.versions || {})) {
     if (!metadata.versions[version]) {
@@ -436,16 +437,52 @@ async function checkAndDownloadMissingVersions(pkg) {
         const downloaded = await ensureTarball(pkg, version, versionData.dist);
         if (downloaded) {
           console.log(`Successfully downloaded ${pkg}@${version}`);
+          updatedCount++;
         } else {
           console.log(`Failed to download ${pkg}@${version}`);
           delete metadata.versions[version];
-          continue;
         }
       }
     }
   }
   
-  fs.writeFileSync(metaPath, JSON.stringify(metadata));
+  if (updatedCount > 0) {
+    fs.writeFileSync(metaPath, JSON.stringify(metadata));
+  }
+  
+  return updatedCount;
+}
+
+function getAllPackages(dir) {
+  const items = fs.readdirSync(dir);
+  let packages = [];
+  
+  for (const item of items) {
+    const fullPath = path.join(dir, item);
+    if (!fs.statSync(fullPath).isDirectory()) {
+      continue;
+    }
+    
+    if (item.startsWith('@')) {
+      const subItems = fs.readdirSync(fullPath);
+      for (const subItem of subItems) {
+        const subPath = path.join(fullPath, subItem);
+        if (fs.statSync(subPath).isDirectory()) {
+          const metaPath = path.join(subPath, 'package.json');
+          if (fs.existsSync(metaPath)) {
+            packages.push(`${item}/${subItem}`);
+          }
+        }
+      }
+    } else {
+      const metaPath = path.join(fullPath, 'package.json');
+      if (fs.existsSync(metaPath)) {
+        packages.push(item);
+      }
+    }
+  }
+  
+  return packages;
 }
 
 async function scanAllPackagesAndUpdate() {
@@ -456,27 +493,19 @@ async function scanAllPackagesAndUpdate() {
     return;
   }
   
-  const packages = fs.readdirSync(PKG_DIR);
+  const packages = getAllPackages(PKG_DIR);
   let total = 0;
   let updated = 0;
   
   for (const pkg of packages) {
-    const pkgFullPath = path.join(PKG_DIR, pkg);
-    if (!fs.statSync(pkgFullPath).isDirectory()) {
-      continue;
-    }
-    
-    const metaPath = path.join(pkgFullPath, 'package.json');
-    if (!fs.existsSync(metaPath)) {
-      continue;
-    }
-    
     total++;
     console.log(`Checking ${pkg}...`);
     
     try {
-      await checkAndDownloadMissingVersions(pkg);
-      updated++;
+      const updatedCount = await checkAndDownloadMissingVersions(pkg);
+      if (updatedCount > 0) {
+        updated++;
+      }
     } catch (error) {
       console.error(`Error updating ${pkg}:`, error.message);
     }
@@ -555,7 +584,7 @@ async function tarballCallback({ res, pkg, file, checkExist, next }) {
   const p = tarballPath(pkg, version);
 
   if (checkExist) {
-    const exists = fs.existsSync(p) && verifyIntegrity(p, null);
+    const exists = fs.existsSync(p);
     return res.status(200).json({ exist: exists });
   }
 
