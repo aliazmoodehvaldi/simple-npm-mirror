@@ -289,7 +289,7 @@ async function getFileHash(filePath) {
   });
 }
 
-async function ensureTarballWithRetry(pkg, version, dist, maxRetries = 3) {
+async function downloadTarballOnDemand(pkg, version, dist, maxRetries = 3) {
   const dest = tarballPath(pkg, version);
   
   if (fs.existsSync(dest)) {
@@ -299,6 +299,8 @@ async function ensureTarballWithRetry(pkg, version, dist, maxRetries = 3) {
       fs.unlinkSync(dest);
     }
   }
+
+  fs.mkdirSync(pkgPath(pkg), { recursive: true });
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     for (const registry of REGISTRIES) {
@@ -356,10 +358,6 @@ async function ensureTarballWithRetry(pkg, version, dist, maxRetries = 3) {
   return false;
 }
 
-async function ensureTarball(pkg, version, dist) {
-  return await ensureTarballWithRetry(pkg, version, dist);
-}
-
 async function rebuildMetadataOnError(pkg, host) {
   const metaPath = metaPackagePath(pkg);
   if (fs.existsSync(metaPath)) {
@@ -391,17 +389,10 @@ async function buildMetadata(pkg, host) {
 
   fs.writeFileSync(metaPackagePath(pkg), JSON.stringify(merged));
 
-  for (const v of Object.keys(merged.versions)) {
-    const meta = merged.versions[v];
-    if (meta.dist && meta.dist.tarball) {
-      await ensureTarball(pkg, v, meta.dist);
-    }
-  }
-
   return merged;
 }
 
-async function checkAndDownloadMissingVersions(pkg) {
+async function checkAndUpdateMetadataOnly(pkg) {
   const metaPath = metaPackagePath(pkg);
   
   if (!fs.existsSync(metaPath)) {
@@ -425,24 +416,13 @@ async function checkAndDownloadMissingVersions(pkg) {
   
   for (const [version, versionData] of Object.entries(mergedFresh.versions || {})) {
     if (!metadata.versions[version]) {
-      console.log(`Found new version ${version} for ${pkg}, downloading...`);
-      
       metadata.versions[version] = versionData;
       
       if (metadata.versions[version].dist) {
         metadata.versions[version].dist.tarball = buildTarballUrl(OWN_REGISTRY, pkg, version);
       }
       
-      if (versionData.dist && versionData.dist.tarball) {
-        const downloaded = await ensureTarball(pkg, version, versionData.dist);
-        if (downloaded) {
-          console.log(`Successfully downloaded ${pkg}@${version}`);
-          updatedCount++;
-        } else {
-          console.log(`Failed to download ${pkg}@${version}`);
-          delete metadata.versions[version];
-        }
-      }
+      updatedCount++;
     }
   }
   
@@ -454,6 +434,8 @@ async function checkAndDownloadMissingVersions(pkg) {
 }
 
 function getAllPackages(dir) {
+  if (!fs.existsSync(dir)) return [];
+  
   const items = fs.readdirSync(dir);
   let packages = [];
   
@@ -502,7 +484,7 @@ async function scanAllPackagesAndUpdate() {
     console.log(`Checking ${pkg}...`);
     
     try {
-      const updatedCount = await checkAndDownloadMissingVersions(pkg);
+      const updatedCount = await checkAndUpdateMetadataOnly(pkg);
       if (updatedCount > 0) {
         updated++;
       }
@@ -631,7 +613,7 @@ async function tarballCallback({ res, pkg, file, checkExist, next }) {
     return throwErr(404, 'Tarball distribution information not found');
   }
 
-  const downloaded = await ensureTarball(pkg, version, meta.dist);
+  const downloaded = await downloadTarballOnDemand(pkg, version, meta.dist);
   if (!downloaded) {
     return throwErr(500, 'Failed to download tarball from all registries');
   }
