@@ -205,70 +205,67 @@ function mergeMetadata(list) {
     return value !== null && typeof value === 'object';
   }
 
-  function deepMerge(target, source, seen = new WeakMap()) {
-    if (!isObject(source)) return source;
-
-    if (seen.has(source)) {
-      return seen.get(source);
+  function deepMerge(target, source) {
+    if (source === null || source === undefined) {
+      return target !== undefined ? target : null;
     }
 
-    let result;
+    if (target === null || target === undefined) {
+      target = isObject(source) ? (Array.isArray(source) ? [] : {}) : source;
+    }
+
+    if (!isObject(source)) {
+      return source;
+    }
 
     if (Array.isArray(source)) {
-      result = Array.isArray(target) ? [...target] : [];
-      seen.set(source, result);
-
+      if (!Array.isArray(target)) {
+        target = [];
+      }
       for (const item of source) {
-        result.push(deepMerge(undefined, item, seen));
+        if (isObject(item) && !Array.isArray(item) && item !== null) {
+          const existingIndex = target.findIndex(t => 
+            isObject(t) && t.version === item.version
+          );
+          if (existingIndex >= 0) {
+            target[existingIndex] = deepMerge(target[existingIndex], item);
+          } else {
+            target.push(deepMerge(undefined, item));
+          }
+        } else {
+          if (!target.includes(item)) {
+            target.push(deepMerge(undefined, item));
+          }
+        }
       }
-      return result;
+      return target;
     }
 
-    if (source instanceof Date) {
-      return new Date(source.getTime());
-    }
-
-    if (source instanceof Map) {
-      result = new Map(target instanceof Map ? target : []);
-      seen.set(source, result);
-
-      for (const [key, value] of source.entries()) {
-        result.set(key, deepMerge(result.get(key), value, seen));
-      }
-      return result;
-    }
-
-    if (source instanceof Set) {
-      result = new Set(target instanceof Set ? target : []);
-      seen.set(source, result);
-
-      for (const value of source.values()) {
-        result.add(deepMerge(undefined, value, seen));
-      }
-      return result;
-    }
-
-    result = { ...(isObject(target) ? target : {}) };
-    seen.set(source, result);
-
+    const result = { ...(isObject(target) ? target : {}) };
     for (const key of Reflect.ownKeys(source)) {
       const sourceVal = source[key];
       const targetVal = result[key];
-
+      
       if (isObject(sourceVal)) {
-        result[key] = deepMerge(targetVal, sourceVal, seen);
+        result[key] = deepMerge(targetVal, sourceVal);
       } else {
-        result[key] = sourceVal;
+        if (sourceVal !== null && sourceVal !== undefined) {
+          result[key] = sourceVal;
+        }
       }
     }
-
     return result;
   }
 
-  let data = {};
+  if (!list || list.length === 0) {
+    return {};
+  }
 
+  let data = {};
   for (const meta of list) {
-    data = deepMerge(data, meta);
+    if (meta && typeof meta === 'object') {
+      data = deepMerge(data, meta);
+    }
   }
 
   return data;
@@ -537,17 +534,28 @@ async function metadataCallback({ res, pkg, checkExist, next, req }) {
 
   res.setHeader('Content-Type', 'application/json');
 
-  const json = JSON.stringify(meta);
+  try {
+    const json = JSON.stringify(meta);
+    JSON.parse(json);
 
-  if ((req.headers['accept-encoding'] || '').includes('gzip')) {
-    res.setHeader('Content-Encoding', 'gzip');
-
-    zlib.gzip(json, (err, gz) => {
-      if (err) return next();
-      res.end(gz);
-    });
-  } else {
-    res.end(json);
+    if ((req.headers['accept-encoding'] || '').includes('gzip')) {
+      res.setHeader('Content-Encoding', 'gzip');
+      zlib.gzip(json, (err, gz) => {
+        if (err) return next();
+        res.end(gz);
+      });
+    } else {
+      res.end(json);
+    }
+  } catch (err) {
+    try {
+      await rebuildMetadataOnError(pkg, OWN_REGISTRY);
+      const newMeta = await getMetadata(pkg, OWN_REGISTRY);
+      const newJson = JSON.stringify(newMeta);
+      res.end(newJson);
+    } catch (rebuildErr) {
+      return res.status(500).json({ error: 'Failed to generate valid metadata' });
+    }
   }
 }
 
